@@ -133,9 +133,16 @@ jobs:
             echo "no change ($NOW_STATUS), no message"
           fi
 
+      # Once a day is plenty for a 60-day timer: only runs that start in the 03:xx UTC hour
+      # (about 12 of them) and manual runs do it, never the other ~276 runs of the day.
       - name: Keepalive (stop GitHub auto-disabling the schedule after 60 days without repo activity)
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/uptime.yml/enable" && echo "workflow re-enabled (keepalive)"
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$(date -u +%H)" = "03" ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/uptime.yml/enable" && echo "workflow re-enabled (keepalive)"
+          else
+            echo "keepalive: not the 03 UTC hour, skipped"
+          fi
