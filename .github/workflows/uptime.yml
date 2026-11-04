@@ -1,0 +1,141 @@
+# Uptime check for Rolling Around, run from GitHub's servers (outside the box it watches).
+#
+# Every ~5 minutes: GET each URL below and expect HTTP 200. A URL that fails is retried once
+# 60s later; failing twice in a row counts as DOWN. Telegram messages go to Yan's own bot:
+#   - one message when the service goes DOWN,
+#   - one message when it is back UP (no repeats while it stays down).
+# Last known status lives in status.json on the `state` branch (written only on a change).
+# If the Telegram send itself fails, the run goes red, which makes GitHub email the repo owner.
+#
+# Manual test: Actions > uptime > Run workflow, put one or more URLs in "test_urls".
+# A test run checks only those URLs, labels the message as a TEST, and never reads or
+# writes the stored status.
+#
+# Secrets (repo settings, never in this file): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+# No third-party actions are used: only shell steps with curl, jq and gh from the runner image.
+# Added 2026-11-04 after the 2h43m nginx outage nobody was alerted about.
+
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_urls:
+        description: "TEST ONLY: space-separated URLs to check instead of the real ones (message is labelled TEST, stored status untouched)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # status.json on the `state` branch
+  actions: write   # keepalive: re-enable this workflow so GitHub does not switch the schedule off after 60 quiet days
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Check endpoints and alert on change
+        env:
+          REAL_URLS: "https://api.rollingaround.dev/version https://rollingaround.app/"
+          TEST_URLS: ${{ inputs.test_urls }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e -uo pipefail  # errors are handled explicitly below (GitHub's default shell adds -e)
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          NOW=$(date -u '+%Y-%m-%d %H:%M UTC')
+          if [ -n "${TEST_URLS// /}" ]; then MODE="test"; URLS="$TEST_URLS"; else MODE="live"; URLS="$REAL_URLS"; fi
+          echo "mode=$MODE event=$GITHUB_EVENT_NAME at $NOW"
+
+          check() {  # prints the HTTP status, 000 when the connection fails or times out
+            curl -s -o /dev/null --connect-timeout 10 -m 20 -A "rollingaround-uptime (GitHub Actions)" -w '%{http_code}' "$1" || true
+          }
+
+          tg() {  # send one Telegram message; never prints the token or chat id
+            local resp ok
+            [ -n "${TG_TOKEN:-}" ] && [ -n "${TG_CHAT:-}" ] || { echo "::error::Telegram secrets missing"; return 1; }
+            resp=$(curl -s -m 20 --retry 2 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" \
+              --data-urlencode "disable_web_page_preview=true") || { echo "::error::Telegram request failed"; return 1; }
+            ok=$(jq -r '.ok' <<<"$resp" 2>/dev/null)
+            echo "telegram sendMessage: ok=$ok message_id=$(jq -r '.result.message_id // "-"' <<<"$resp" 2>/dev/null) error=$(jq -r '.description // "-"' <<<"$resp" 2>/dev/null)"
+            [ "$ok" = "true" ]
+          }
+
+          # 1st attempt for every URL, 2nd attempt 60s later for the ones that failed.
+          failed=()
+          for u in $URLS; do
+            c=$(check "$u"); echo "attempt 1: $u -> $c"
+            [ "$c" = "200" ] || failed+=("$u")
+          done
+          down=()
+          if [ ${#failed[@]} -gt 0 ]; then
+            sleep 60
+            for u in "${failed[@]}"; do
+              c=$(check "$u"); echo "attempt 2: $u -> $c"
+              [ "$c" = "200" ] || down+=("$u -> HTTP $c")
+            done
+          fi
+          if [ ${#down[@]} -gt 0 ]; then NOW_STATUS=down; else NOW_STATUS=up; fi
+          DETAIL=$(printf '%s\n' "${down[@]}")
+          echo "result: $NOW_STATUS"
+
+          if [ "$MODE" = test ]; then
+            echo "TEST mode: stored status is not read or written"
+            if [ "$NOW_STATUS" = down ]; then
+              tg "TEST of the new Rolling Around uptime alert, nothing real is down. This manual run checked a deliberately bad URL, which failed twice 60s apart:
+          $DETAIL
+          Real checks run every 5 min against api.rollingaround.dev/version and rollingaround.app.
+          Run: $RUN_URL" || exit 1
+            else
+              echo "all test URLs returned 200, no message sent"
+            fi
+            exit 0
+          fi
+
+          # Live mode: compare with the last stored status and alert only on a change.
+          PREV=up; PREV_SINCE=""; SHA=""
+          if st=$(gh api "repos/$GITHUB_REPOSITORY/contents/status.json?ref=state" 2>/dev/null); then
+            SHA=$(jq -r '.sha' <<<"$st")
+            body=$(jq -r '.content' <<<"$st" | base64 -d)
+            PREV=$(jq -r '.status // "up"' <<<"$body"); PREV_SINCE=$(jq -r '.since // ""' <<<"$body")
+          else
+            echo "::warning::could not read status.json on the state branch, assuming up"
+          fi
+          echo "previous: $PREV since ${PREV_SINCE:-?}"
+
+          save() {  # status since detail
+            local json args
+            json=$(jq -n --arg s "$1" --arg since "$2" --arg d "$3" '{status:$s, since:$since, detail:$d}')
+            args=(-X PUT "repos/$GITHUB_REPOSITORY/contents/status.json" -f "message=status: $1 ($2)" -f branch=state -f "content=$(base64 -w0 <<<"$json")")
+            [ -n "$SHA" ] && args+=(-f "sha=$SHA")
+            gh api "${args[@]}" >/dev/null && echo "stored status: $1"
+          }
+
+          if [ "$PREV" != down ] && [ "$NOW_STATUS" = down ]; then
+            tg "Rolling Around DOWN (failed 2 checks 60s apart, $NOW):
+          $DETAIL
+          First look: ssh rollingaround-prod 'systemctl status nginx --no-pager; pm2 ls'
+          Run: $RUN_URL" || exit 1
+            save down "$NOW" "$DETAIL" || echo "::warning::alert sent but status not stored (next run may alert again)"
+          elif [ "$PREV" = down ] && [ "$NOW_STATUS" = up ]; then
+            tg "Rolling Around back UP: all checks 200 at $NOW (down since ${PREV_SINCE:-unknown}).
+          Run: $RUN_URL" || exit 1
+            save up "$NOW" "" || echo "::warning::recovery sent but status not stored (next run may send it again)"
+          else
+            echo "no change ($NOW_STATUS), no message"
+          fi
+
+      - name: Keepalive (stop GitHub auto-disabling the schedule after 60 days without repo activity)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/uptime.yml/enable" && echo "workflow re-enabled (keepalive)"
