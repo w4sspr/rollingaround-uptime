@@ -1,5 +1,5 @@
 {
-  "status": "down",
-  "since": "2026-11-05 21:57 UTC",
-  "detail": "https://api.rollingaround.dev/version -> HTTP 000\nhttps://rollingaround.app/ -> HTTP 000"
+  "status": "up",
+  "since": "2026-11-06 02:14 UTC",
+  "detail": ""
 }
